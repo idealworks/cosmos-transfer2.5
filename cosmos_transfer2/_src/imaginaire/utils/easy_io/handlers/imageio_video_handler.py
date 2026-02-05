@@ -151,13 +151,24 @@ class ImageioVideoHandler(BaseFileHandler):
         # Use provided ffmpeg_params if any, otherwise use defaults
         final_ffmpeg_params = ffmpeg_params if ffmpeg_params is not None else default_ffmpeg_params
 
+        # Check if custom ffmpeg_params are provided with codec settings
+        # If so, skip quality parameter to avoid duplicate codec options
+        has_custom_codec = ffmpeg_params is not None and any(
+            param in ffmpeg_params for param in ["-c:v", "-codec:v", "-vcodec"]
+        )
+
         mimsave_kwargs = {
             "fps": fps,
-            "quality": quality,
             "macro_block_size": 1,
             "ffmpeg_params": final_ffmpeg_params,
             "output_params": ["-f", "mp4"],
         }
+
+        # Only add quality if not using custom codec settings and quality is not None
+        # (quality parameter internally sets codec which conflicts with custom ffmpeg_params)
+        if not has_custom_codec and quality is not None:
+            mimsave_kwargs["quality"] = quality
+
         # Update with any other kwargs
         mimsave_kwargs.update(kwargs)
         log.debug(f"mimsave_kwargs: {mimsave_kwargs}")

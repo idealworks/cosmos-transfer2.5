@@ -549,7 +549,9 @@ def _compute_depth_maps(video_np: np.ndarray) -> torch.Tensor | None:
         or None if computation fails
     """
     try:
-        from cosmos_transfer2._src.transfer2.auxiliary.depth_anything.video_depth_model import VideoDepthAnythingModel
+        from cosmos_transfer2._src.transfer2.auxiliary.depth_anything.video_depth_anything import (
+            VideoDepthAnythingModel,
+        )
 
         log.info(f"Computing depth for video with shape {video_np.shape}...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -581,12 +583,22 @@ def generate_control_weight_mask_from_prompt(
     prompt: str,
     output_folder: str,
     modality: str,
+    invert: bool = False,
 ) -> str | None:
     """Generate binary control weight mask from text prompt using SAM2.
-    In multi-GPU: only rank 0 generates, others wait and reuse."""
+    In multi-GPU: only rank 0 generates, others wait and reuse.
+    
+    Args:
+        video_path: Path to input video
+        prompt: Text prompt for SAM2 segmentation
+        output_folder: Directory to save output mask
+        modality: Control modality name (edge, depth, vis, seg)
+        invert: If True, invert the mask after generation (for exclusion masks)
+    """
     os.makedirs(output_folder, exist_ok=True)
     mask_name = os.path.splitext(os.path.basename(video_path))[0]
-    output_mask_path = os.path.join(output_folder, f"{mask_name}_{modality}_mask.mp4")
+    suffix = "_inverted" if invert else ""
+    output_mask_path = os.path.join(output_folder, f"{mask_name}_{modality}_mask{suffix}.mp4")
 
     try:
         import torch.distributed as dist
@@ -596,23 +608,81 @@ def generate_control_weight_mask_from_prompt(
         is_distributed = False
 
     if is_distributed and dist.get_rank() == 0:
-        log.info(f"Generating mask from prompt: '{prompt}' for {modality}")
+        log.info(f"Generating mask from prompt: '{prompt}' for {modality} (invert={invert})")
 
     if not is_distributed or dist.get_rank() == 0:
         segment = VideoSegmentationModel()
-        try:
-            segment(
-                input_video=video_path,
-                prompt=prompt,
-                output_video=output_mask_path,
-                weight_scaler=1.0,
-                binarize_video=True,
-            )
-        except (IndexError, ValueError):
-            log.warning(f"No mask generated for prompt '{prompt}'")
-            if is_distributed:
-                dist.barrier()
-            return None
+        
+        if invert:
+            # Generate to temp file, then invert
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                temp_output = tmp.name
+            
+            try:
+                segment(
+                    input_video=video_path,
+                    prompt=prompt,
+                    output_video=temp_output,
+                    weight_scaler=1.0,
+                    binarize_video=True,
+                )
+                
+                # Read and invert the mask
+                cap = cv2.VideoCapture(temp_output)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                frames = []
+                
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    # Invert: white becomes black, black becomes white
+                    inverted = 255 - frame
+                    frames.append(inverted)
+                
+                cap.release()
+                
+                # Write inverted video
+                if frames:
+                    h, w = frames[0].shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out = cv2.VideoWriter(output_mask_path, fourcc, fps, (w, h))
+                    for frame in frames:
+                        out.write(frame)
+                    out.release()
+                    log.info(f"Generated inverted mask: {len(frames)} frames")
+                else:
+                    log.warning(f"No frames to invert for prompt '{prompt}'")
+                    os.unlink(temp_output)
+                    if is_distributed:
+                        dist.barrier()
+                    return None
+                    
+                os.unlink(temp_output)
+                
+            except (IndexError, ValueError) as e:
+                log.warning(f"No mask generated for prompt '{prompt}': {e}")
+                if os.path.exists(temp_output):
+                    os.unlink(temp_output)
+                if is_distributed:
+                    dist.barrier()
+                return None
+        else:
+            # Standard mask generation (no inversion)
+            try:
+                segment(
+                    input_video=video_path,
+                    prompt=prompt,
+                    output_video=output_mask_path,
+                    weight_scaler=1.0,
+                    binarize_video=True,
+                )
+            except (IndexError, ValueError):
+                log.warning(f"No mask generated for prompt '{prompt}'")
+                if is_distributed:
+                    dist.barrier()
+                return None
 
     if is_distributed:
         dist.barrier()
@@ -620,6 +690,7 @@ def generate_control_weight_mask_from_prompt(
             return None
 
     return output_mask_path
+
 
 
 def read_and_process_control_input(
@@ -746,13 +817,18 @@ def read_and_process_control_input(
 
         control_mask_path = input_control_paths.get(f"{modality}_mask")
         mask_prompt = input_control_paths.get(f"{modality}_mask_prompt")
+        invert_mask = input_control_paths.get(f"{modality}_invert_mask", False)
 
         if control_mask_path is not None and mask_prompt is not None:
             log.warning(f"{modality}: Both mask path and mask prompt provided. Using mask path.")
 
         if control_mask_path is None and mask_prompt is not None:
             control_mask_path = generate_control_weight_mask_from_prompt(
-                video_path=video_path, prompt=mask_prompt, output_folder=tempfile.gettempdir(), modality=modality
+                video_path=video_path, 
+                prompt=mask_prompt, 
+                output_folder=tempfile.gettempdir(), 
+                modality=modality,
+                invert=invert_mask,
             )
             if control_mask_path is None:
                 log.warning(f"{modality}: No mask generated from prompt '{mask_prompt}', continuing without mask.")

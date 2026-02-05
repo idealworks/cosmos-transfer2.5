@@ -25,15 +25,12 @@ from typing import Annotated, Any, Literal, NoReturn, Optional, TypeVar
 
 import pydantic
 import tyro
-from cosmos_oss.checkpoints_transfer2 import register_checkpoints
 from pydantic_core import PydanticUndefined
 from typing_extensions import Self
 
-from cosmos_transfer2._src.imaginaire.flags import EXPERIMENTAL_CHECKPOINTS, SMOKE
+from cosmos_transfer2._src.imaginaire.flags import SMOKE
 from cosmos_transfer2._src.imaginaire.utils import log
 from cosmos_transfer2._src.imaginaire.utils.checkpoint_db import get_checkpoint_by_uuid
-
-register_checkpoints()
 
 
 @cache
@@ -152,12 +149,9 @@ class CompileMode(str, enum.Enum):
 @dataclass(frozen=True, kw_only=True)
 class ModelKey:
     variant: ModelVariant = ModelVariant.EDGE
-    distilled: bool = False
 
     @cached_property
     def name(self) -> str:
-        if self.distilled:
-            return f"{self.variant.value}/distilled"
         return self.variant.value
 
     def __str__(self) -> str:
@@ -171,12 +165,6 @@ MODEL_CHECKPOINTS = {
     ModelKey(variant=ModelVariant.VIS): get_checkpoint_by_uuid("ba2f44f2-c726-4fe7-949f-597069d9b91c"),
     ModelKey(variant=ModelVariant.AUTO_MULTIVIEW): get_checkpoint_by_uuid("4ecc66e9-df19-4aed-9802-0d11e057287a"),
 }
-if EXPERIMENTAL_CHECKPOINTS:
-    MODEL_CHECKPOINTS |= {
-        ModelKey(variant=ModelVariant.EDGE, distilled=True): get_checkpoint_by_uuid(
-            "41f07f13-f2e4-4e34-ba4c-86f595acbc20"
-        ),
-    }
 
 MODEL_KEYS = {k.name: k for k in MODEL_CHECKPOINTS.keys()}
 
@@ -220,8 +208,8 @@ class CommonSetupArguments(pydantic.BaseModel):
     """Path to the checkpoint. Override this if you have a post-training checkpoint"""
     experiment: str | None = None
     """Experiment name. Override this with your custom experiment when post-training"""
-    config_file: str = ""
-    """Configuration file for the model. Leave empty to use the default config for the selected model type."""
+    config_file: str = "cosmos_transfer2/_src/predict2/configs/video2world/config.py"
+    """Configuration file for the model."""
     context_parallel_size: pydantic.PositiveInt | None = None
     """Context parallel size. Defaults to WORLD_SIZE set by torchrun."""
     disable_guardrails: bool = True if SMOKE else False
@@ -267,12 +255,6 @@ class CommonSetupArguments(pydantic.BaseModel):
             data["checkpoint_path"] = checkpoint.path
         if data.get("experiment") is None:
             data["experiment"] = checkpoint.experiment
-        # Set config file based on model type (distilled vs non-distilled)
-        if not data.get("config_file"):
-            if model_key.distilled:
-                data["config_file"] = "cosmos_transfer2/_src/interactive/configs/registry_transfer2p5.py"
-            else:
-                data["config_file"] = "cosmos_transfer2/_src/transfer2/configs/vid2vid_transfer/config.py"
         if data.get("context_parallel_size") is None:
             data["context_parallel_size"] = int(os.environ.get("WORLD_SIZE", "1"))
         return data
@@ -417,6 +399,9 @@ class ControlConfig(pydantic.BaseModel):
     """Path to a pre-computed binary spatiotemporal mask. White pixels are where the control is applied, black pixels are ignored. Only one of {mask_path} or {mask_prompt} should be provided."""
     mask_prompt: str | None = None
     """Prompt for generating a mask on the fly (eg "car building tree"). Passed to the SAM2 model to segment the objects in the prompt and create masks."""
+    invert_mask: bool = False
+    """If True, invert the mask after generation. Useful for EXCLUDING objects (e.g., segment "floor . ceiling" and invert to get everything EXCEPT floor and ceiling)."""
+
 
 
 class DepthConfig(ControlConfig):
@@ -533,6 +518,7 @@ class InferenceArguments(CommonInferenceArguments):
             control_modalities[key] = path_to_str(getattr(self, key).control_path)
             control_modalities[f"{key}_mask"] = path_to_str(getattr(self, key).mask_path)
             control_modalities[f"{key}_mask_prompt"] = getattr(self, key).mask_prompt
+            control_modalities[f"{key}_invert_mask"] = getattr(self, key).invert_mask
         return control_modalities
 
     @cached_property
