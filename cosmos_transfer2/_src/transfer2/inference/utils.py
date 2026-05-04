@@ -746,6 +746,7 @@ def read_and_process_control_input(
 
         control_mask_path = input_control_paths.get(f"{modality}_mask")
         mask_prompt = input_control_paths.get(f"{modality}_mask_prompt")
+        invert_mask = bool(input_control_paths.get(f"{modality}_invert_mask"))
 
         if control_mask_path is not None and mask_prompt is not None:
             log.warning(f"{modality}: Both mask path and mask prompt provided. Using mask path.")
@@ -764,9 +765,14 @@ def read_and_process_control_input(
                 interpolation=cv2.INTER_LINEAR,
                 s3_credential_path=s3_credential_path,
             )
-            control_input_dict[f"{control_key}_mask"] = (control_mask_attr[:1] > 127.5).to(torch.bool)
+            mask_bool = (control_mask_attr[:1] > 127.5).to(torch.bool)
+            mask_float = control_mask_attr.float() / 255.0
+            if invert_mask:
+                mask_bool = ~mask_bool
+                mask_float = 1.0 - mask_float
+            control_input_dict[f"{control_key}_mask"] = mask_bool
             if mask_prompt is not None:
-                mask_video_dict[modality] = control_mask_attr.float() / 255.0
+                mask_video_dict[modality] = mask_float
 
     return control_input_dict, mask_video_dict
 

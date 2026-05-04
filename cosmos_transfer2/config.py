@@ -436,6 +436,8 @@ class ControlConfig(pydantic.BaseModel):
     """Path to a pre-computed binary spatiotemporal mask. White pixels are where the control is applied, black pixels are ignored. Only one of {mask_path} or {mask_prompt} should be provided."""
     mask_prompt: str | None = None
     """Prompt for generating a mask on the fly (eg "car building tree"). Passed to the SAM2 model to segment the objects in the prompt and create masks."""
+    invert_mask: bool = False
+    """If True, invert the mask after it is loaded or generated — control is applied where the mask is black instead of white."""
 
 
 class DepthConfig(ControlConfig):
@@ -561,6 +563,7 @@ class InferenceArguments(CommonInferenceArguments):
             control_modalities[key] = path_to_str(getattr(self, key).control_path)
             control_modalities[f"{key}_mask"] = path_to_str(getattr(self, key).mask_path)
             control_modalities[f"{key}_mask_prompt"] = getattr(self, key).mask_prompt
+            control_modalities[f"{key}_invert_mask"] = getattr(self, key).invert_mask
         return control_modalities
 
     @cached_property
