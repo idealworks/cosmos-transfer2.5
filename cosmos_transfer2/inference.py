@@ -164,9 +164,10 @@ class Control2WorldInference:
         if self.process_group is None:
             return failed
 
-        import torch
-        # Convert bool to tensor for broadcasting
-        failure_tensor = torch.tensor([1 if failed else 0], dtype=torch.long)
+        # NCCL requires CUDA tensors; broadcast rank 0's status to the whole
+        # context-parallel group so every rank takes the same abort path and
+        # none is left hanging in a later collective.
+        failure_tensor = torch.tensor([1 if failed else 0], dtype=torch.long, device="cuda")
         distributed.broadcast(failure_tensor, src=0, group=self.process_group)
         return bool(failure_tensor.item())
 
