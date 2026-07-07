@@ -74,8 +74,8 @@ class Control2WorldInference:
         torch.enable_grad(False)  # Disable gradient calculations for inference
 
         self.device_rank = 0
+        self.process_group = None
 
-        process_group = None
         # pyrefly: ignore  # unsupported-operation
         if args.context_parallel_size > 1:
             from megatron.core import parallel_state
@@ -84,8 +84,8 @@ class Control2WorldInference:
 
             # pyrefly: ignore  # bad-argument-type
             parallel_state.initialize_model_parallel(context_parallel_size=args.context_parallel_size)
-            process_group = parallel_state.get_context_parallel_group()
-            self.device_rank = distributed.get_rank(process_group)
+            self.process_group = parallel_state.get_context_parallel_group()
+            self.device_rank = distributed.get_rank(self.process_group)
 
         if args.enable_guardrails and self.device_rank == 0:
             self.text_guardrail_runner = guardrail_presets.create_text_guardrail_runner(
@@ -127,7 +127,7 @@ class Control2WorldInference:
             checkpoint_paths=self.checkpoint_list,
             s3_credential_path="",
             exp_override_opts=exp_override_opts,
-            process_group=process_group,
+            process_group=self.process_group,
             use_cp_wan=args.enable_parallel_tokenizer,
             wan_cp_grid=args.parallel_tokenizer_grid,
             benchmark_timer=self.benchmark_timer if args.benchmark else None,
@@ -154,6 +154,21 @@ class Control2WorldInference:
             # pyrefly: ignore  # bad-argument-type
             LazyConfig.save_yaml(self.inference_pipeline.config, config_path)
             log.info(f"Saved config to {config_path}")
+
+    def _broadcast_guardrail_failure(self, failed: bool) -> bool:
+        """Broadcast guardrail failure status from rank 0 to all ranks.
+
+        Returns:
+            True if guardrail failed on any rank, False otherwise.
+        """
+        if self.process_group is None:
+            return failed
+
+        import torch
+        # Convert bool to tensor for broadcasting
+        failure_tensor = torch.tensor([1 if failed else 0], dtype=torch.long)
+        distributed.broadcast(failure_tensor, src=0, group=self.process_group)
+        return bool(failure_tensor.item())
 
     def generate(self, samples: list[InferenceArguments], output_dir: Path) -> list[str]:
         if SMOKE:
@@ -202,6 +217,7 @@ class Control2WorldInference:
         guided_generation_step_threshold = sample.guided_generation_step_threshold
         guided_generation_foreground_labels = sample.guided_generation_foreground_labels
 
+        guardrail_failed = False
         if self.device_rank == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
             open(f"{output_path}.json", "w").write(sample.model_dump_json())
@@ -215,28 +231,30 @@ class Control2WorldInference:
                     if not guardrail_presets.run_text_guardrail(prompt, self.text_guardrail_runner):
                         message = f"Guardrail blocked generation. Prompt: {prompt}"
                         log.critical(message)
-                        if self.setup_args.keep_going:
-                            return None
-                        else:
-                            raise Exception(message)
+                        guardrail_failed = True
                     else:
                         log.success("Passed guardrail on prompt")
 
-                    if negative_prompt is not None:
-                        if not guardrail_presets.run_text_guardrail(
-                            negative_prompt,
-                            self.text_guardrail_runner,
-                        ):
-                            message = f"Guardrail blocked generation. Negative prompt: {negative_prompt}"
-                            log.critical(message)
-                            if self.setup_args.keep_going:
-                                return None
+                        if negative_prompt is not None:
+                            if not guardrail_presets.run_text_guardrail(
+                                negative_prompt,
+                                self.text_guardrail_runner,
+                            ):
+                                message = f"Guardrail blocked generation. Negative prompt: {negative_prompt}"
+                                log.critical(message)
+                                guardrail_failed = True
                             else:
-                                raise Exception(message)
-                        else:
-                            log.success("Passed guardrail on negative prompt")
+                                log.success("Passed guardrail on negative prompt")
                 elif self.text_guardrail_runner is None:
                     log.warning("Guardrail checks on prompt are disabled")
+
+        # Broadcast guardrail failure to all ranks (must happen outside rank 0 block)
+        guardrail_failed = self._broadcast_guardrail_failure(guardrail_failed)
+        if guardrail_failed:
+            if self.setup_args.keep_going:
+                return None
+            else:
+                raise Exception("Guardrail check failed. Aborting generation.")
 
         input_control_video_paths = sample.control_modalities
         log.info(f"Processing the following paths: {input_control_video_paths}")
@@ -303,6 +321,7 @@ class Control2WorldInference:
             )
 
         # Save video/image
+        guardrail_failed = False
         if self.device_rank == 0:
             output_video = (1.0 + output_video[0]) / 2
             for key in control_video_dict:
@@ -321,19 +340,24 @@ class Control2WorldInference:
                     frames = frames.permute(1, 2, 3, 0).cpu().numpy().astype(np.uint8)  # (T, H, W, C)
                     processed_frames = guardrail_presets.run_video_guardrail(frames, self.video_guardrail_runner)
                     if processed_frames is None:
-                        if self.setup_args.keep_going:
-                            return None
-                        else:
-                            raise Exception("Guardrail blocked video2world generation.")
+                        guardrail_failed = True
                     else:
                         log.success("Passed guardrail on generated video")
-
-                    # Convert processed frames back to tensor format
-                    processed_video = torch.from_numpy(processed_frames).float().permute(3, 0, 1, 2) / 255.0
-                    output_video = processed_video.to(output_video.device, dtype=output_video.dtype)
+                        # Convert processed frames back to tensor format
+                        processed_video = torch.from_numpy(processed_frames).float().permute(3, 0, 1, 2) / 255.0
+                        output_video = processed_video.to(output_video.device, dtype=output_video.dtype)
                 else:
                     log.warning("Guardrail checks on video are disabled")
 
+        # Broadcast guardrail failure to all ranks (must happen outside rank 0 block)
+        guardrail_failed = self._broadcast_guardrail_failure(guardrail_failed)
+        if guardrail_failed:
+            if self.setup_args.keep_going:
+                return None
+            else:
+                raise Exception("Guardrail blocked video2world generation.")
+
+        if self.device_rank == 0:
             # Remove batch dimension and normalize to [0, 1] range
             save_img_or_video(output_video, str(output_path), fps=fps)
             # save prompt
