@@ -576,28 +576,94 @@ def _compute_depth_maps(video_np: np.ndarray) -> torch.Tensor | None:
         return None
 
 
-def generate_control_weight_masks_from_prompts(
-    video_path: str,
-    prompts: list[str],
-    output_folder: str,
-) -> dict[str, str | None]:
-    """Generate one binary control weight mask per distinct text prompt using SAM2.
+def _sam2_output_path(video_path: str, prompt: str | None, output_folder: str, kind: str) -> str:
+    name = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(output_folder, f"{name}_{hashlib.sha1(f'{prompt}'.encode()).hexdigest()[:12]}_{kind}.mp4")
 
-    In multi-GPU the prompts are dealt round-robin across ranks, so distinct masks are
-    generated concurrently; every rank then reads them from the shared output folder.
-    One mask stays on one rank: SAM2 tracks frame by frame, so a video cannot be split.
 
-    Returns prompt -> mask path, or None where no mask was produced."""
-    prompts = list(dict.fromkeys(prompts))
-    if not prompts:
-        return {}
+def _sam2_job(video_path: str, prompt: str | None, binary_mask: bool) -> Callable[[str], None]:
+    segment_kwargs = {"weight_scaler": 1.0, "binarize_video": True} if binary_mask else {}
 
-    os.makedirs(output_folder, exist_ok=True)
-    mask_name = os.path.splitext(os.path.basename(video_path))[0]
-    mask_paths = {
-        prompt: os.path.join(output_folder, f"{mask_name}_{hashlib.sha1(prompt.encode()).hexdigest()[:12]}_mask.mp4")
-        for prompt in prompts
-    }
+    def job(output_path: str) -> None:
+        log.info(f"Running SAM2 for prompt '{prompt}' -> {output_path}", rank0_only=False)
+        segment = VideoSegmentationModel()
+        try:
+            segment(input_video=video_path, prompt=prompt, output_video=output_path, **segment_kwargs)
+        except (IndexError, ValueError):
+            log.warning(f"SAM2 found nothing for prompt '{prompt}'", rank0_only=False)
+
+    return job
+
+
+def _depth_job(video_path: str, s3_credential_path: str | None) -> Callable[[str], None]:
+    def job(output_path: str) -> None:
+        log.info(f"Computing depth -> {output_path}", rank0_only=False)
+        # Load video at original resolution; the readers resize after loading the depth
+        video_frames, _ = read_video_or_image_into_frames_BCTHW(
+            video_path,
+            H=None,
+            W=None,
+            normalize=False,
+            max_frames=-1,
+            also_return_fps=True,
+            s3_credential_path=s3_credential_path,
+        )
+        # Convert to (T, H, W, C) format for depth models
+        if isinstance(video_frames, torch.Tensor):
+            video_np = einops.rearrange(video_frames[0].cpu().numpy(), "c t h w -> t h w c")
+        else:
+            video_np = einops.rearrange(video_frames[0], "c t h w -> t h w c")
+        video_np = np.clip(video_np, 0, 255).astype(np.uint8)
+
+        depth_computed = _compute_depth_maps(video_np)
+        if depth_computed is not None:
+            torch.save(depth_computed, output_path)
+
+    return job
+
+
+def _dist_barrier() -> None:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            dist.barrier()
+    except (ImportError, AttributeError):
+        pass
+
+
+CONTROL_CACHE_DIR_ENV = "COSMOS_CONTROL_CACHE_DIR"
+
+
+def _control_output_folder(video_path: str) -> tuple[str, bool]:
+    """Where this video's computed controls and masks go, and whether they persist.
+
+    With COSMOS_CONTROL_CACHE_DIR set they are kept in a per-video folder under it and later
+    runs on the same video reuse them; the folder is keyed by the video's content, so a
+    different file under the same name does not hit it. Otherwise the temp dir, single use."""
+    cache_root = os.environ.get(CONTROL_CACHE_DIR_ENV)
+    if not cache_root:
+        return tempfile.gettempdir(), False
+    digest = hashlib.sha256()
+    with open(video_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    folder = os.path.join(cache_root, f"v1_{digest.hexdigest()[:24]}")
+    os.makedirs(folder, exist_ok=True)
+    return folder, True
+
+
+def _run_across_ranks(jobs: dict[str, Callable[[str], None]], reuse_existing: bool = False) -> None:
+    """Run each job (output path -> function that writes the path it is given) exactly once.
+
+    In multi-GPU the jobs are dealt round-robin across ranks and run concurrently, instead of
+    every rank repeating all of them; each rank returns once all jobs are done and then reads
+    the outputs from the shared folder. One job stays on one rank: SAM2 and the depth model
+    track frame by frame, so a video cannot be split. A job that fails leaves no output file.
+
+    With reuse_existing, an output that is already there is kept and its job skipped."""
+    if not jobs:
+        return
 
     try:
         import torch.distributed as dist
@@ -607,31 +673,44 @@ def generate_control_weight_masks_from_prompts(
         is_distributed = False
     rank, world_size = (dist.get_rank(), dist.get_world_size()) if is_distributed else (0, 1)
 
-    for index, prompt in enumerate(prompts):
+    for index, (output_path, job) in enumerate(jobs.items()):
         if index % world_size != rank:
             continue
-        output_mask_path = mask_paths[prompt]
-        # The path depends only on the video's name and the prompt, and a long-lived worker
-        # keeps its temp dir between runs: without this, a failed generation would leave an
-        # earlier run's mask in place and the existence check below would accept it.
-        if os.path.exists(output_mask_path):
-            os.remove(output_mask_path)
-        log.info(f"Generating mask from prompt: '{prompt}' on rank {rank}")
-        segment = VideoSegmentationModel()
-        try:
-            segment(
-                input_video=video_path,
-                prompt=prompt,
-                output_video=output_mask_path,
-                weight_scaler=1.0,
-                binarize_video=True,
-            )
-        except (IndexError, ValueError):
-            log.warning(f"No mask generated for prompt '{prompt}'")
+        if os.path.exists(output_path):
+            if reuse_existing:
+                log.info(f"Reusing cached {output_path}", rank0_only=False)
+                # Refreshes the age an external cache pruner goes by.
+                os.utime(output_path)
+                continue
+            # The path depends only on the video's name and the prompt, and a long-lived
+            # worker keeps its temp dir between runs: without this, a failed job would leave
+            # an earlier run's output in place and the callers' existence checks would
+            # accept it.
+            os.remove(output_path)
+        # Written under another name first (same extension — the video writer picks its
+        # format from it): a half-written file must never pass an existence check, here or
+        # in another worker sharing the cache.
+        root, ext = os.path.splitext(output_path)
+        partial_path = f"{root}.{os.getpid()}.part{ext}"
+        job(partial_path)
+        if os.path.exists(partial_path):
+            os.replace(partial_path, output_path)
 
-    if is_distributed:
-        dist.barrier()
+    _dist_barrier()
 
+
+def generate_control_weight_masks_from_prompts(
+    video_path: str,
+    prompts: list[str],
+    output_folder: str,
+) -> dict[str, str | None]:
+    """Generate one binary control weight mask per distinct text prompt using SAM2.
+
+    Returns prompt -> mask path, or None where no mask was produced."""
+    mask_paths = {
+        prompt: _sam2_output_path(video_path, prompt, output_folder, "mask") for prompt in dict.fromkeys(prompts)
+    }
+    _run_across_ranks({path: _sam2_job(video_path, prompt, binary_mask=True) for prompt, path in mask_paths.items()})
     return {prompt: path if os.path.exists(path) else None for prompt, path in mask_paths.items()}
 
 
@@ -694,17 +773,33 @@ def read_and_process_control_input(
         },
     }
 
-    prompt_mask_paths = generate_control_weight_masks_from_prompts(
-        video_path=video_path,
-        prompts=[
-            input_control_paths[f"{modality}_mask_prompt"]
-            for modality in hint_key
-            if modality in modality_config
+    # Every model pass this call needs — the seg and depth controls and the prompt masks —
+    # goes out in one batch, so in multi-GPU they run side by side on different ranks.
+    shared_folder, outputs_persist = _control_output_folder(video_path)
+    rank_jobs = {}
+    seg_control_path = None
+    seg_input_path = input_control_paths.get("seg")
+    if "seg" in hint_key and not (seg_input_path and os.path.exists(seg_input_path)):
+        seg_control_path = _sam2_output_path(video_path, seg_control_prompt, shared_folder, "seg")
+        rank_jobs[seg_control_path] = _sam2_job(video_path, seg_control_prompt, binary_mask=False)
+    depth_control_path = None
+    depth_input_path = input_control_paths.get("depth")
+    if "depth" in hint_key and not (depth_input_path and os.path.exists(depth_input_path)):
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        depth_control_path = os.path.join(shared_folder, f"{video_name}_depth.pt")
+        rank_jobs[depth_control_path] = _depth_job(video_path, s3_credential_path)
+    prompt_mask_paths = {}
+    for modality in hint_key:
+        mask_prompt = input_control_paths.get(f"{modality}_mask_prompt")
+        if (
+            modality in modality_config
             and input_control_paths.get(f"{modality}_mask") is None
-            and input_control_paths.get(f"{modality}_mask_prompt") is not None
-        ],
-        output_folder=tempfile.gettempdir(),
-    )
+            and mask_prompt is not None
+            and mask_prompt not in prompt_mask_paths
+        ):
+            prompt_mask_paths[mask_prompt] = _sam2_output_path(video_path, mask_prompt, shared_folder, "mask")
+            rank_jobs[prompt_mask_paths[mask_prompt]] = _sam2_job(video_path, mask_prompt, binary_mask=True)
+    _run_across_ranks(rank_jobs, reuse_existing=outputs_persist)
 
     for modality in hint_key:
         if modality not in modality_config:
@@ -729,44 +824,25 @@ def read_and_process_control_input(
             # For depth/seg: computed here using third party models
             # For edge/vis: skip (computed by augmentor)
             if modality == "seg":
-                log.info(f"Computing seg masks on the fly with prompt {seg_control_prompt=}.")
-                segment = VideoSegmentationModel()
-                with tempfile.NamedTemporaryFile(suffix=".mp4") as temp_output_video:
-                    segment(input_video=video_path, prompt=seg_control_prompt, output_video=temp_output_video.name)
-                    control_attr, fps, _, _ = read_and_resize_input(
-                        temp_output_video.name,
-                        resolution=resolution,
-                        interpolation=config["interpolation"],
-                        s3_credential_path=s3_credential_path,
-                    )
-                    control_input_dict["control_input_seg"] = control_attr
-            elif modality == "depth":
-                # Load video at original resolution, compute depth, then resize
-                video_frames, _ = read_video_or_image_into_frames_BCTHW(
-                    video_path,
-                    H=None,
-                    W=None,
-                    normalize=False,
-                    max_frames=-1,
-                    also_return_fps=True,
+                if not os.path.exists(seg_control_path):
+                    raise RuntimeError(f"SAM2 produced no segmentation for {seg_control_prompt=}")
+                control_attr, fps, _, _ = read_and_resize_input(
+                    seg_control_path,
+                    resolution=resolution,
+                    interpolation=config["interpolation"],
                     s3_credential_path=s3_credential_path,
                 )
-                # Convert to (T, H, W, C) format for depth models
-                if isinstance(video_frames, torch.Tensor):
-                    video_np = einops.rearrange(video_frames[0].cpu().numpy(), "c t h w -> t h w c")
-                else:
-                    video_np = einops.rearrange(video_frames[0], "c t h w -> t h w c")
-                video_np = np.clip(video_np, 0, 255).astype(np.uint8)
-
-                depth_computed = _compute_depth_maps(video_np)
-                if depth_computed is not None:
-                    depth_rgb = depth_computed.expand(3, -1, -1, -1)  # (3, T, H, W)
+                control_input_dict["control_input_seg"] = control_attr
+            elif modality == "depth":
+                if os.path.exists(depth_control_path):
+                    depth_rgb = torch.load(depth_control_path).expand(3, -1, -1, -1)  # (3, T, H, W)
                     control_input_dict[control_key] = _resize_to_target_resolution(
                         depth_rgb,
                         resolution=resolution,
                         interpolation=config["interpolation"],
                     )
                 else:
+                    log.warning("depth: computation failed, continuing without the depth control input.")
                     control_input_dict[control_key] = None
 
         control_mask_path = input_control_paths.get(f"{modality}_mask")
@@ -777,8 +853,9 @@ def read_and_process_control_input(
             log.warning(f"{modality}: Both mask path and mask prompt provided. Using mask path.")
 
         if control_mask_path is None and mask_prompt is not None:
-            control_mask_path = prompt_mask_paths.get(mask_prompt)
-            if control_mask_path is None:
+            control_mask_path = prompt_mask_paths[mask_prompt]
+            if not os.path.exists(control_mask_path):
+                control_mask_path = None
                 log.warning(f"{modality}: No mask generated from prompt '{mask_prompt}', continuing without mask.")
 
         if control_mask_path:
@@ -796,6 +873,15 @@ def read_and_process_control_input(
             control_input_dict[f"{control_key}_mask"] = mask_bool
             if mask_prompt is not None:
                 mask_video_dict[modality] = mask_float
+
+    if depth_control_path is not None and not outputs_persist:
+        # Unlike the small mask videos this is raw float depth, hundreds of MB per video: drop
+        # it once every rank has loaded it, or a long-lived worker's temp dir fills up.
+        _dist_barrier()
+        try:
+            os.remove(depth_control_path)
+        except FileNotFoundError:
+            pass
 
     return control_input_dict, mask_video_dict
 
