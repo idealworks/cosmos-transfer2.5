@@ -576,17 +576,28 @@ def _compute_depth_maps(video_np: np.ndarray) -> torch.Tensor | None:
         return None
 
 
-def generate_control_weight_mask_from_prompt(
+def generate_control_weight_masks_from_prompts(
     video_path: str,
-    prompt: str,
+    prompts: list[str],
     output_folder: str,
-    modality: str,
-) -> str | None:
-    """Generate binary control weight mask from text prompt using SAM2.
-    In multi-GPU: only rank 0 generates, others wait and reuse."""
+) -> dict[str, str | None]:
+    """Generate one binary control weight mask per distinct text prompt using SAM2.
+
+    In multi-GPU the prompts are dealt round-robin across ranks, so distinct masks are
+    generated concurrently; every rank then reads them from the shared output folder.
+    One mask stays on one rank: SAM2 tracks frame by frame, so a video cannot be split.
+
+    Returns prompt -> mask path, or None where no mask was produced."""
+    prompts = list(dict.fromkeys(prompts))
+    if not prompts:
+        return {}
+
     os.makedirs(output_folder, exist_ok=True)
     mask_name = os.path.splitext(os.path.basename(video_path))[0]
-    output_mask_path = os.path.join(output_folder, f"{mask_name}_{modality}_mask.mp4")
+    mask_paths = {
+        prompt: os.path.join(output_folder, f"{mask_name}_{hashlib.sha1(prompt.encode()).hexdigest()[:12]}_mask.mp4")
+        for prompt in prompts
+    }
 
     try:
         import torch.distributed as dist
@@ -594,11 +605,18 @@ def generate_control_weight_mask_from_prompt(
         is_distributed = dist.is_initialized()
     except (ImportError, AttributeError):
         is_distributed = False
+    rank, world_size = (dist.get_rank(), dist.get_world_size()) if is_distributed else (0, 1)
 
-    if is_distributed and dist.get_rank() == 0:
-        log.info(f"Generating mask from prompt: '{prompt}' for {modality}")
-
-    if not is_distributed or dist.get_rank() == 0:
+    for index, prompt in enumerate(prompts):
+        if index % world_size != rank:
+            continue
+        output_mask_path = mask_paths[prompt]
+        # The path depends only on the video's name and the prompt, and a long-lived worker
+        # keeps its temp dir between runs: without this, a failed generation would leave an
+        # earlier run's mask in place and the existence check below would accept it.
+        if os.path.exists(output_mask_path):
+            os.remove(output_mask_path)
+        log.info(f"Generating mask from prompt: '{prompt}' on rank {rank}")
         segment = VideoSegmentationModel()
         try:
             segment(
@@ -610,16 +628,11 @@ def generate_control_weight_mask_from_prompt(
             )
         except (IndexError, ValueError):
             log.warning(f"No mask generated for prompt '{prompt}'")
-            if is_distributed:
-                dist.barrier()
-            return None
 
     if is_distributed:
         dist.barrier()
-        if not os.path.exists(output_mask_path):
-            return None
 
-    return output_mask_path
+    return {prompt: path if os.path.exists(path) else None for prompt, path in mask_paths.items()}
 
 
 def read_and_process_control_input(
@@ -680,6 +693,18 @@ def read_and_process_control_input(
             "fallback_msg": None,
         },
     }
+
+    prompt_mask_paths = generate_control_weight_masks_from_prompts(
+        video_path=video_path,
+        prompts=[
+            input_control_paths[f"{modality}_mask_prompt"]
+            for modality in hint_key
+            if modality in modality_config
+            and input_control_paths.get(f"{modality}_mask") is None
+            and input_control_paths.get(f"{modality}_mask_prompt") is not None
+        ],
+        output_folder=tempfile.gettempdir(),
+    )
 
     for modality in hint_key:
         if modality not in modality_config:
@@ -752,9 +777,7 @@ def read_and_process_control_input(
             log.warning(f"{modality}: Both mask path and mask prompt provided. Using mask path.")
 
         if control_mask_path is None and mask_prompt is not None:
-            control_mask_path = generate_control_weight_mask_from_prompt(
-                video_path=video_path, prompt=mask_prompt, output_folder=tempfile.gettempdir(), modality=modality
-            )
+            control_mask_path = prompt_mask_paths.get(mask_prompt)
             if control_mask_path is None:
                 log.warning(f"{modality}: No mask generated from prompt '{mask_prompt}', continuing without mask.")
 
